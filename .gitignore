@@ -1,0 +1,4 @@
+config.toml
+config_back/
+__pycache__/
+*.pyc
