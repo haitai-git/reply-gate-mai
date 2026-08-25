@@ -45,6 +45,9 @@ import os  # 定位插件自身目录以只读 config.toml
 import re  # 判定结果文本解析
 import time  # 统计时间戳
 import tomllib  # 解析主配置 bot_config.toml（Python 3.11+ 标准库，只读）
+import uuid  # 生成 Context Item 快照的 item_id
+
+from datetime import datetime  # 生成 Context Item 快照的 meta.timestamp
 
 import httpx  # OpenAI 兼容接口直连
 
@@ -72,8 +75,14 @@ SKIP: 群友在聊与麦麦无关的话题
 # 配合 after_response 清空输出，保证本轮绝不会发出任何内容。
 SLIM_SYSTEM_PROMPT = "你是 MaiBot 的占位轮处理器。当前已判定本批消息无需回应，请不要调用任何工具，直接回复两个字母：SKIP"
 
-# 用于从模型输出文本中提取判定结论的正则：兼容 REPLY/SKIP 的大小写与前后缀干扰。
-VERDICT_PATTERN = re.compile(r"\b(REPLY|SKIP)\b", re.IGNORECASE)
+# 用于从模型输出文本中提取判定结论的正则。
+# 必须是「行首结论词」：只允许输出以少量空白/符号装饰（括号、引号、星号、短横、冒号等）
+# 后紧跟 REPLY/SKIP 才采信。若之前有较长的杂前缀（例如 "needed** response: SKIP: ..."），
+# 不匹配 → 判 UNKNOWN → 走缩小重试或 fail-open，避免把混乱输出误读成 REPLY/SKIP。
+VERDICT_PATTERN = re.compile(
+    r"^\s*[\-–—*•·\"'“”‘’「」【】\[\]()（）<>:：,，.]*\s*(REPLY|SKIP)\b",
+    re.IGNORECASE,
+)
 
 # 判定上下文中的媒体描述（图片/表情包/语音）只保留占位符：
 # 判定只需知道"这条消息是发图/表情/语音"，整段描述对要不要回复无帮助，
@@ -112,17 +121,27 @@ REAL_MSG_REPLY_SCAN_RECENT = 2
 # 判定上下文与规则过滤中应跳过的注入/装饰类 user 文本前缀（非真实聊天发言）。
 # 命中任一前缀即视为非真实发言；真实发言（含 @、回复引用等）不在此列。
 # 注意：MaiBot 会在真实发言之后追加黑话参考([黑话参考])、行为表现参考([行为表现参考])、
-# 已折叠工具调用([已折叠的历史工具调用]) 等 user 角色注入消息，若不忽略它们，
-# 会把真正的发言挤出 @/点名 规则的"最近真实发言"扫描窗口，导致被@也误判 SKIP。
+# 已折叠工具调用([已折叠的历史工具调用])、聊天回想/启发式记忆/长期记忆检索/人物画像等
+# user 角色注入消息，若不忽略它们，会把真正的发言挤出 @/点名 规则的"最近真实发言"
+# 扫描窗口（注入总结里通常提到机器人名字），导致"没 @ 也被判成被@，且误判 SKIP"。
 SKIPPED_USER_TEXT_PREFIXES = (
     "时间：",
     "<system-reminder>",
     "【人物画像",
     "【历史摘要",
+    "【聊天回想",
+    "【启发式记忆",
+    "【长期记忆检索结果",
     "[预判]",
     "[黑话参考]",
     "[行为表现参考]",
+    "[行为表现情景分析约束]",
     "[已折叠的历史工具调用]",
+    "[上下文恢复]",
+    "[参考消息]",
+    "[回复效果评分任务]",
+    "[表情包选择任务]",
+    "[表情包拼图候选]",
     "当前聊天额外注意事项：",
 )
 
@@ -178,41 +197,62 @@ def _estimate_tokens(text: str) -> int:
     return max(1, round(len(text) / CHARS_PER_TOKEN))
 
 
-def _extract_content_text(content: Any) -> str:
-    """从一条消息的 content 提取纯文本。
+def _text_from_item(item: Any) -> str:
+    """从一个 Context Item 快照中提取纯文本。
 
-    Planner 序列化后的消息 content 可能是纯字符串，也可能是多模态片段列表
-    （文本片段、图片片段等）。判定只需要文本语义，因此只摘取 text 片段，
+    MaiBot 1.2.3 起 Planner Hook 载荷是「Context Item」序列化结构：
+    ``{"item_type": "UserMessageItem", "meta": {...}, "parts": [...]}``。
+    文本只存在于 parts 的 text/refusal 片段里，图片等非文本片段忽略，
     避免把图片的 base64 之类的大体积内容塞进便宜模型的输入。
 
-    注意：含 @/富文本的 user 消息常被序列化成「字符串列表」，例如
-    ``['<message ...>', '@佑树', ' 生成图片：…']``——必须把字符串元素也拼接进去，
-    否则这类带 @ 的真实发言会被提取成空文本、从判定/user_texts 中静默丢失，
-    导致「明明被 @ 了却看不到、误判 SKIP」。
-
     Args:
-        content: 消息 content 字段。
+        item: 单个 Item 快照字典。
 
     Returns:
-        str: 拼接后的纯文本；没有可提取文本时返回空字符串。
+        str: 提取出的纯文本；无文本时返回空字符串。
     """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts = []
-        for item in content:
-            if isinstance(item, str):
-                text_parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    text_parts.append(text)
-                else:
-                    data = item.get("data")
-                    if isinstance(data, str):
-                        text_parts.append(data)
-        return " ".join(text_parts)
-    return ""
+    if not isinstance(item, dict):
+        return ""
+    parts = item.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    text_parts: List[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+        elif part_type == "refusal":
+            refusal = part.get("refusal")
+            if isinstance(refusal, str):
+                text_parts.append(refusal)
+    return "".join(text_parts)
+
+
+def _build_item_snapshot(item_type: str, text: str) -> Dict[str, Any]:
+    """构造一个合法的 Context Item 快照（供 SKIP 占位与预判注入使用）。
+
+    Hook 改写时返回的快照会被宿主用 deserialize_context_item_snapshot 还原为
+    Context Item，字段必须满足：meta.item_id 非空、meta.logical_turn_id 键存在
+    （可为 None）、meta.timestamp 为 ISO 字符串、parts 至少含一个非空文本片段。
+    """
+    return {
+        "item_type": item_type,
+        "meta": {
+            "item_id": uuid.uuid4().hex,
+            "logical_turn_id": None,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "parts": [{"type": "text", "text": text}],
+    }
+
+
+def _is_user_item(item: Any) -> bool:
+    """判断一个 Item 快照是否为用户消息。"""
+    return isinstance(item, dict) and item.get("item_type") == "UserMessageItem"
 
 
 class ReplyGatePlugin(MaiBotPlugin):
@@ -255,6 +295,9 @@ class ReplyGatePlugin(MaiBotPlugin):
         # 麦麦昵称列表（config/bot_config.toml 的 [bot].nickname + alias_names），
         # 供规则前置过滤识别"被@/提起机器人名字"；读不到时为空（规则不命中，安全）。
         self._bot_names: List[str] = []
+        # 真 @ 识别候选：昵称 + 别名 + 备用账号（[bot].qq_account 等）。
+        # MaiBot 会把 @ 富文本渲染成 "@名字" 或 "@QQ号"，二者都作为被 @ 的判别 token。
+        self._bot_at_tokens: List[str] = []
         # 旧历史摘要缓存：session_id -> (被摘区指纹, 摘要文本)。
         # 被摘历史未变时直接复用摘要，避免每轮都重复调用判定模型。
         self._summary_cache: Dict[str, Tuple[str, str]] = {}
@@ -298,6 +341,7 @@ class ReplyGatePlugin(MaiBotPlugin):
         await self._rebuild_client()
         self._behavior_style = self._load_behavior_style()
         self._bot_names = self._load_bot_names()
+        self._bot_at_tokens = self._load_bot_at_tokens()
         # 启动"期望发送"超时清扫任务（卸载时取消；重复加载有去重保护）。
         self._start_sweeper()
         # 同步真实消息 @ 识别开关（重载/热更新后以配置为准）。
@@ -418,6 +462,44 @@ class ReplyGatePlugin(MaiBotPlugin):
                 unique.append(name)
         return unique
 
+    def _load_bot_at_tokens(self) -> List[str]:
+        """只读加载真 @ 识别候选（config/bot_config.toml 的 [bot].nickname + alias_names + 备用账号）。
+
+        MaiBot 把 @ 富文本渲染成 "@目标名"（见 src/maisaka/context/message_adapter.py 的
+        _render_at_component_text）；目标名优先用卡片名/昵称，都没有时回退为 QQ 号。
+        因此这里把昵称、别名和备用账号都纳入 "@token" 比对，确保 `@麦麦`、`@2136...` 都能命中。
+
+        Returns:
+            List[str]: 去重后的 @ 候选列表（含账号，不做长度过滤）；可能为空。
+        """
+        tokens: List[str] = []
+        try:
+            with open(BOT_CONFIG_PATH, "rb") as f:
+                data = tomllib.load(f)
+            section = data.get("bot") or {}
+            candidates = [section.get("nickname"), section.get("alias_names")]
+            for item in candidates:
+                if isinstance(item, str) and item.strip():
+                    tokens.append(item.strip())
+                elif isinstance(item, (list, tuple)):
+                    tokens.extend(str(x).strip() for x in item if isinstance(x, str) and x.strip())
+            for account_key in ("qq_account", "account", "robot_id"):
+                account = section.get(account_key)
+                if isinstance(account, str) and account.strip():
+                    tokens.append(account.strip())
+        except (OSError, ValueError, TypeError):
+            self.ctx.logger.debug(
+                f"[回复省流闸门] 读取 {BOT_CONFIG_PATH} 的 @ 识别候选失败，被@规则不生效",
+                exc_info=True,
+            )
+        seen = set()
+        unique = []
+        for token in tokens:
+            if token and token not in seen:
+                seen.add(token)
+                unique.append(token)
+        return unique
+
     async def _rebuild_client(self) -> None:
         """按当前 llm 配置创建/重建 HTTP 客户端。
 
@@ -467,20 +549,18 @@ class ReplyGatePlugin(MaiBotPlugin):
         for message in messages:
             if not isinstance(message, dict):
                 continue
-            total_chars += len(_extract_content_text(message.get("content")))
+            total_chars += len(_text_from_item(message))
         return round(total_chars / CHARS_PER_TOKEN) + BASE_SYSTEM_TOKEN_ESTIMATE
 
     # ---- 上下文构建（窗口参数化，便于降载与缩小重试复用）----
 
     def _collect_user_texts(self, messages: List[Dict[str, Any]]) -> List[str]:
-        """从序列化 messages 中收集全部 user 文本（未截断、已去空）。"""
+        """从 Context Item 序列化载荷中收集全部 user 文本（未截断、已去空）。"""
         texts = []
         for message in messages:
-            if not isinstance(message, dict):
+            if not _is_user_item(message):
                 continue
-            if message.get("role") != "user":
-                continue
-            text = _extract_content_text(message.get("content")).strip()
+            text = _text_from_item(message).strip()
             if text:
                 texts.append(text)
         return texts
@@ -508,9 +588,8 @@ class ReplyGatePlugin(MaiBotPlugin):
             if not isinstance(message, dict):
                 collapsed.append(message)
                 continue
-            role = message.get("role")
-            text = _extract_content_text(message.get("content")).strip()
-            if role == "user" and text:
+            text = _text_from_item(message).strip() if _is_user_item(message) else ""
+            if _is_user_item(message) and text:
                 if text == prev_user_text:
                     # 与上一条 user 完全相同：丢弃，仅保留前一条。
                     changed = True
@@ -639,11 +718,20 @@ class ReplyGatePlugin(MaiBotPlugin):
         # 只取 user_texts[-1] 会错过真正被 @ 的发言。这里扫描最近 N 条真实发言
         # （开后端开关 scan_recent_replies 时生效；关闭则回到只看最后一条的旧逻辑）。
         for latest in self._rule_latest_texts(user_texts):
-            # 被@或提起机器人名字：昵称/别名命中即放行（@ 富文本会被适配器展开成姓名文本）。
-            if self.config.judge.at_mention_reply and self._bot_names:
+            # 真 @：消息含 "@昵称" 或 "@QQ号"（MaiBot 会把 @ 富文本渲染成 @目标名，
+            # 见 src/maisaka/context/message_adapter.py 的 _render_at_component_text）。
+            # 与口头点名分开：@ 是"按钮 @"，本开关默认开，被真 @ 才直接放行。
+            if self.config.judge.at_button_reply and self._bot_at_tokens:
+                for token in self._bot_at_tokens:
+                    if f"@{token}" in latest:
+                        return f"被@（{token}）"
+            # 口头点名（无 @，但消息里提到机器人名字）：独立开关，默认关。
+            # 打开后任何提到昵称/别名的消息都会直接放行，可能把普通聊天误判为必回，
+            # 因此由用户自行选择是否开启。
+            if self.config.judge.name_mention_reply and self._bot_names:
                 for name in self._bot_names:
                     if name in latest:
-                        return f"被@或提起机器人名字（{name}）"
+                        return f"口头点名（{name}）"
             # 直接提问：含疑问关键字（默认关，避免误判）。
             if self.config.judge.question_word_reply:
                 for word in QUESTION_WORDS:
@@ -659,7 +747,7 @@ class ReplyGatePlugin(MaiBotPlugin):
         for message in messages:
             if not isinstance(message, dict):
                 continue
-            total_chars += len(_extract_content_text(message.get("content")))
+            total_chars += len(_text_from_item(message))
         return round(total_chars / CHARS_PER_TOKEN) + REQUEST_FIXED_OVERHEAD_TOKENS
 
     async def _call_summarizer(self, text: str) -> Optional[str]:
@@ -739,7 +827,7 @@ class ReplyGatePlugin(MaiBotPlugin):
         body: List[Dict[str, Any]] = []
         in_body = False
         for message in messages:
-            if not in_body and message.get("role") == "system":
+            if not in_body and isinstance(message, dict) and message.get("item_type") == "SystemMessageItem":
                 head.append(message)
             else:
                 in_body = True
@@ -751,7 +839,7 @@ class ReplyGatePlugin(MaiBotPlugin):
         if not old_zone:
             return messages, False
 
-        old_text = "\n".join(_extract_content_text(m.get("content")) for m in old_zone).strip()
+        old_text = "\n".join(_text_from_item(m) for m in old_zone).strip()
         if not old_text:
             return messages, False
 
@@ -772,7 +860,7 @@ class ReplyGatePlugin(MaiBotPlugin):
                 f"保留最近 {len(keep_tail)} 条完整消息"
             )
 
-        summarized = [*head, {"role": "system", "content": f"[历史摘要] {summary_text}"}, *keep_tail]
+        summarized = [*head, _build_item_snapshot("SystemMessageItem", f"[历史摘要] {summary_text}"), *keep_tail]
         return summarized, True
 
     # ---- 判定调用 ----
@@ -830,6 +918,11 @@ class ReplyGatePlugin(MaiBotPlugin):
         except (KeyError, IndexError, TypeError):
             content = ""
         verdict, reason = self._parse_verdict(content)
+        # 记录判定模型原始输出与解析结果（debug），便于排查判定模型飘忽/假 REPLY。
+        self.ctx.logger.debug(
+            f"[回复省流闸门] 判定模型原始输出: "
+            f"{ ' '.join(str(content).split())[:200] or '（空）' }（解析为 {verdict}）"
+        )
 
         # 提取实际消耗：优先接口 usage，缺失回退估算（输入估算 + 输出估算）。
         usage_tokens = 0
@@ -937,8 +1030,9 @@ class ReplyGatePlugin(MaiBotPlugin):
     def _parse_verdict(content: str) -> Tuple[str, str]:
         """从模型输出的正文里解析判定结论（REPLY/SKIP）与理由。
 
-        模型偶尔会多输出前缀、标点或 JSON 包裹，用正则粗匹配结论词即可；
-        匹配不到时返回 UNKNOWN，由上层走 fail-open 放行。
+        结论词必须位于输出**开头**（允许少量空白/括号/引号等装饰），避免模型输出的
+        杂前缀（如 "needed** response: SKIP: ..."）被误读成 REPLY/SKIP；这一类输出
+        统一判 UNKNOWN，由上层缩小窗口重试一次，仍失败则走 fail-open 放行（安全）。
 
         Returns:
             (判定结论, 理由文本)。
@@ -969,12 +1063,13 @@ class ReplyGatePlugin(MaiBotPlugin):
         usage: int,
         full_estimate: int,
         original_messages: Optional[List[Dict[str, Any]]] = None,
+        hook_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """记录判定结果并返回 Hook 改写结果。
 
-        SKIP -> 返回压缩请求的 Hook 结果；
+        SKIP -> 返回压缩请求的 Hook 结果（占位 Context Items + 空工具定义）；
         REPLY/其他 -> 默认返回 None 原样放行；若开启放行注入预判
-        （judge.inject_reply_reason）且传入 original_messages，则前插一条预判消息。
+        （judge.inject_reply_reason）且传入 original_messages，则前插一条预判 Item。
         """
         model_name = self.config.plugin.model.strip() or "（未填）"
         self._stats["total"] += 1
@@ -996,47 +1091,48 @@ class ReplyGatePlugin(MaiBotPlugin):
             self._stats["saved_input_tokens"] += full_estimate
             self._verdicts[session_id] = "SKIP"
             self.ctx.logger.info(f"[回复省流闸门] 判定=SKIP（拦截，屏蔽主 Planner）理由: {reason}")
-            slim_messages = [
-                {"role": "system", "content": SLIM_SYSTEM_PROMPT},
-                {"role": "user", "content": self._latest_user_text_for_slim(session_id)},
+            slim_items = [
+                _build_item_snapshot("SystemMessageItem", SLIM_SYSTEM_PROMPT),
+                _build_item_snapshot("UserMessageItem", self._latest_user_text_for_slim(session_id)),
             ]
+            modified_kwargs = dict(hook_kwargs or {})
+            # 兜底保证 item_schema_version 存在，避免宿主反序列化时因缺失而静默丢弃占位。
+            modified_kwargs.setdefault("item_schema_version", 1)
+            modified_kwargs["items"] = slim_items
+            modified_kwargs["tool_definitions"] = []
             return {
                 "action": "continue",
-                "modified_kwargs": {
-                    "messages": slim_messages,
-                    "tool_definitions": [],
-                },
+                "modified_kwargs": modified_kwargs,
             }
 
         self._verdicts[session_id] = "REPLY"
         self.ctx.logger.info(f"[回复省流闸门] 判定={verdict}（放行主 Planner）理由: {reason}")
         if self.config.judge.inject_reply_reason and original_messages:
-            # 放行注入预判：把判定理由作为一条 user 提示发给主 planner，
+            # 放行注入预判：把判定理由作为一条 user Item 发给主 planner，
             # 让主模型省去"是否回复、怎么切入"的思考，直接组织回复内容。
             # 采用固定前缀模板（reason 放句尾）：消息前缀保持稳定，连续轮次更易
             # 命中 provider 的 prefix cache（缓存友好）。
-            # 插入位置：第一条非 system 消息之前（保持人格 system 在最前），
+            # 插入位置：第一条非 system Item 之前（保持人格 system 在最前），
             # 若全部是 system 则追加到末尾。不改动工具定义。
-            hint_message = {
-                "role": "user",
-                "content": (
-                    "[预判] 判定模型已确认本批消息需要回复。"
-                    "请直接组织回复内容，无需再判断是否回复。\n"
-                    f"理由参考：{reason}"
-                ),
-            }
+            hint_content = (
+                "[预判] 判定模型已确认本批消息需要回复。"
+                "请直接组织回复内容，无需再判断是否回复。\n"
+                f"理由参考：{reason}"
+            )
             injected_messages = list(original_messages)
             insert_at = len(injected_messages)
             for i, msg in enumerate(injected_messages):
-                if msg.get("role") != "system":
+                if not (isinstance(msg, dict) and msg.get("item_type") == "SystemMessageItem"):
                     insert_at = i
                     break
-            injected_messages.insert(insert_at, hint_message)
+            injected_messages.insert(insert_at, _build_item_snapshot("UserMessageItem", hint_content))
+            modified_kwargs = dict(hook_kwargs or {})
+            # 兜底保证 item_schema_version 存在，避免宿主反序列化时因缺失而静默丢弃注入。
+            modified_kwargs.setdefault("item_schema_version", 1)
+            modified_kwargs["items"] = injected_messages
             return {
                 "action": "continue",
-                "modified_kwargs": {
-                    "messages": injected_messages,
-                },
+                "modified_kwargs": modified_kwargs,
             }
         return None
 
@@ -1065,12 +1161,9 @@ class ReplyGatePlugin(MaiBotPlugin):
     )
     async def on_planner_before_request(
         self,
-        messages: Optional[List[Dict[str, Any]]] = None,
-        tool_definitions: Optional[List[Dict[str, Any]]] = None,
-        session_id: str = "",
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
-        """主 planner 请求前的判定 Hook。
+        """主 planner 请求前的判定 Hook（MaiBot 1.2.3+ Context Item 载荷）。
 
         流程：
             1. 插件未激活或缺少必要入参 → 不做任何事，原样放行；
@@ -1080,24 +1173,30 @@ class ReplyGatePlugin(MaiBotPlugin):
             5. 判定结果走 _record_result：SKIP 压缩请求；其他放行。
             6. 任何异常 → 记 fail 并放行（fail-open）。
 
+        载荷说明：新版本 Planner Hook 传入的是 Context Item 序列化快照列表
+        （``items``，形如 {"item_type": ..., "meta": ..., "parts": [...]}），不再
+        是旧式 {role, content} messages。改写 ``items`` 并把 ``tool_definitions``
+        置空，同时保留 ``item_schema_version`` 等键，宿主才能反序列化回 Context Items。
+
         Returns:
             需要改写请求时返回 Hook 结果字典（含 modified_kwargs），
             否则返回 None 表示保持原参。
         """
-        del tool_definitions, kwargs
         if not self._is_active():
             return None
-        if not session_id or not isinstance(messages, list) or not messages:
+        session_id = str(kwargs.get("session_id") or "")
+        items = kwargs.get("items")
+        if not session_id or not isinstance(items, list) or not items:
             return None
 
         # 相邻重复消息折叠（开关默认关；命中时改写主 planner 历史为折叠后的列表）。
-        folded_messages = messages
+        folded_messages = items
         collapsed = False
         if self.config.judge.collapse_repeated:
-            folded_messages, collapsed = self._collapse_repeated_messages(messages)
+            folded_messages, collapsed = self._collapse_repeated_messages(items)
             if collapsed:
                 self.ctx.logger.debug(
-                    f"[回复省流闸门] 折叠了 {len(messages) - len(folded_messages)} 条相邻重复消息"
+                    f"[回复省流闸门] 折叠了 {len(items) - len(folded_messages)} 条相邻重复消息"
                 )
 
         # 收集并暂存 user 文本（供 SKIP 占位取最新一条）。
@@ -1155,13 +1254,18 @@ class ReplyGatePlugin(MaiBotPlugin):
             usage=usage,
             full_estimate=full_estimate,
             original_messages=display_messages,
+            hook_kwargs=dict(kwargs),
         )
         # 折叠或摘要发生在"放行且未注入预判"的路径：_record_result 返回 None（原样放行），
         # 但改写后的历史需要生效，因此单独返回一次改写结果。
         if result is None and (collapsed or summarized_changed):
+            modified_kwargs = dict(kwargs)
+            # 兜底保证 item_schema_version 存在，避免宿主反序列化时因缺失而静默丢弃改写。
+            modified_kwargs.setdefault("item_schema_version", 1)
+            modified_kwargs["items"] = display_messages
             return {
                 "action": "continue",
-                "modified_kwargs": {"messages": display_messages},
+                "modified_kwargs": modified_kwargs,
             }
         return result
 
@@ -1175,18 +1279,18 @@ class ReplyGatePlugin(MaiBotPlugin):
     )
     async def on_planner_after_response(
         self,
-        session_id: str = "",
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
-        """主模型响应后的 Hook。
+        """主模型响应后的 Hook（MaiBot 1.2.3+ Context Item 载荷）。
 
         若本会话最近一次判定为 SKIP：
             - 从缓存表中移除该标记（消费）；
-            - 把响应正文与工具调用清空，主模型占位输出不会产生任何可见内容，
+            - 把 output_items 清空，主模型占位输出不会产生任何可见内容，
               核心按"无工具且无文本"自然收尾，本轮以"不回复"结束。
         若最近一次判定为 REPLY：
-            - 主模型产出了可见正文 → 登记一条"期望发送"（等群里真实发送命中，
-              超窗未命中则计入"放行后最终未发出"）；
+            - 主模型产出了可见正文（output_items 中的 AssistantMessageItem）
+              → 登记一条"期望发送"（等群里真实发送命中，超窗未命中则计入
+              "放行后最终未发出"）；
             - 主模型未产出任何可见文本（只思考、只调工具未说话）→ 计入"放行后未回复"。
         否则不修改任何东西。
 
@@ -1195,18 +1299,21 @@ class ReplyGatePlugin(MaiBotPlugin):
         """
         if not self._is_active():
             return None
+        session_id = str(kwargs.get("session_id") or "")
         if not session_id:
             return None
 
         verdict = self._verdicts.pop(session_id, None)
         if verdict == "SKIP":
-            # 清空文本与工具调用，确保本轮绝无可见发言或副作用动作。
+            # 清空所有输出 Item，确保本轮绝无可见发言或副作用动作。
+            modified_kwargs = dict(kwargs)
+            modified_kwargs["output_items"] = []
             return {
                 "action": "continue",
-                "modified_kwargs": {"response": "", "tool_calls": []},
+                "modified_kwargs": modified_kwargs,
             }
         if verdict == "REPLY":
-            response_text = str(kwargs.get("response") or "").strip()
+            response_text = self._output_items_text(kwargs.get("output_items"))
             if response_text:
                 # 放行且主模型说话了：期望群里会出现一次真实发送（可能是文本，也可能是生图等）。
                 self._expect_send(session_id)
@@ -1214,6 +1321,21 @@ class ReplyGatePlugin(MaiBotPlugin):
                 # 放行但主模型没说话：只思考、或只调了工具没说话，都算"未回复"。
                 self._record_no_reply(session_id)
         return None
+
+    def _output_items_text(self, output_items: Any) -> str:
+        """从 after_response 的 output_items 载荷提取主模型可见正文。
+
+        模型输出可能是多个 Item 混合（reasoning / assistant 正文 / 工具调用等），
+        只有 AssistantMessageItem 的文本会被真正发送，仅拼接这些正文文本。
+        """
+        if not isinstance(output_items, list):
+            return ""
+        text_parts = [
+            _text_from_item(item)
+            for item in output_items
+            if isinstance(item, dict) and item.get("item_type") == "AssistantMessageItem"
+        ]
+        return "".join(text_parts).strip()
 
     def _expect_send(self, session_id: str) -> None:
         """为一次"放行且主模型产出正文"的轮次登记一条期望发送。
@@ -1364,6 +1486,9 @@ class ReplyGatePlugin(MaiBotPlugin):
             f"状态: {'运行中' if active else '未启用'}"
             f"（config.enabled={self.config.plugin.enabled}, 配置完整={configured}）\n"
             f"判定模型: {self.config.plugin.model or '（未填）'}\n"
+            f"规则直放: 被@(按钮)={'开' if self.config.judge.at_button_reply else '关'} | "
+            f"口头点名(提名字)={'开' if self.config.judge.name_mention_reply else '关'} | "
+            f"直接提问={'开' if self.config.judge.question_word_reply else '关'}\n"
             f"真实消息@识别: {'开（最近 %d 条）' % self._realmsg_scan_count if self._realmsg_scan_enabled else '关（旧逻辑：只看最后一条 user 文本）'}\n"
             f"判定: {stats['total']} 次 | 拦截(SKIP) {stats['skip']} | "
             f"放行(REPLY) {stats['reply']} | 失败放行 {stats['fail']}\n"

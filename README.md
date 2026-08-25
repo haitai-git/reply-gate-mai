@@ -34,6 +34,29 @@ git pull
 - 首次启用时 MaiBot 会根据 `config.py` 的默认值自动生成 `config.toml`，只需按下方「启用步骤」填写自己的判定模型配置即可。
 - 更新后建议重载插件（WebUI → 插件管理 → 重载）或重启机器人；大版本更新请留意 `CHANGELOG.md`。
 
+## 兼容性要求（重要）
+
+本插件依赖 MaiBot 的以下命名 Hook：
+
+- `maisaka.planner.before_request`（主 planner 请求前的判定）
+- `maisaka.planner.after_response`（主模型响应后的输出清空）
+- `send_service.after_send`（发送观察）
+
+**MaiBot 1.2.0 起有一处破坏性改动**：核心把 Planner Hook 的载荷从旧式 `messages`（`{role, content}` 列表）迁移为 **Context Item** 结构（`items` / `output_items`，并新增 `item_schema_version` 字段），且 `after_response` 不再传 `response` / `tool_calls`。
+
+由此导致的后果：
+
+- **旧版插件（本次修复之前，对应插件 v1.1.0 及更早的 `plugin.py`）在「MaiBot 1.2.0 及以上」会失效**：
+  - `before_request` 收不到 `messages` → 插件永远按"放行"处理，判定模型不生效；
+  - SKIP 后的输出清空也不生效，占位结果可能照常发出；
+  - 外在表现：像没装插件一样，日志里看不到判定、或"明明拦截了却仍回复"。
+- **MaiBot ≤ 1.1.4 不受影响**，无需任何改动。
+
+处理方法：
+
+- 使用 **MaiBot 1.2.0+** 的用户：请 `git pull` 把插件更新到**本次修复后的版本**（已适配 Context Item 载荷），然后重载插件或重启机器人；
+- 更新后仍异常时，先确认插件目录是否停在了旧提交（`git log --oneline -3` 应能看到本次适配提交）。
+
 ## 启用步骤
 
 1. **填评判模型配置**（`config.toml`）：
@@ -57,8 +80,9 @@ git pull
    inject_behavior_style = true          # 判定时注入麦麦内置行为风格（bot_config.toml）
    inject_reply_reason = false           # 放行时把判定理由作为预判发给主 planner（省思考，默认关）
    collapse_repeated = false             # 折叠相邻完全重复的用户消息（刷屏减负，默认关）
-   at_mention_reply = true               # 被@/提起机器人名字直接放行，跳过判定模型（默认开）
-   question_word_reply = false           # 直接提问（含疑问词）直接放行（默认关）
+   at_button_reply = true              # 真 @ 按钮（@昵称/@QQ号）直接放行，跳过判定模型（默认开）
+   name_mention_reply = false          # 口头点名（无 @ 但提到机器人名字）直接放行（默认关，避免误判）
+   question_word_reply = false         # 直接提问（含疑问词）直接放行（默认关）
    scan_recent_replies = true            # 真实消息@识别：@/点名与判定扫描最近真实发言（默认开）
    scan_recent_count = 2                 # 真实消息@识别扫描的最近真实发言条数（默认 2）
    summary_enabled = false               # 主 planner 输入超预算时用判定模型压缩旧历史（有损，默认关）
@@ -119,7 +143,14 @@ git pull
 - `inject_behavior_style=true` 时，判定提示词会自动追加麦麦内置行为风格（`config/bot_config.toml` 的 `[personality].behavior_style`，与 Planner 同源），让便宜模型按麦麦的「何时参与 / 何时安静」偏好判断；关闭后只用内置模板或 `system_prompt`。读取失败会记日志并自动回退为不注入，不阻塞判定。
 - `inject_reply_reason=true` 时，放行（REPLY）轮会前插一条预判消息（`[预判] 已确认需要回复，请直接组织回复内容`，理由放句尾以保持前缀稳定、利于 provider 缓存）给主 planner，省去主模型"是否回复"的思考段——对带 thinking 的模型收益明显，对 deepseek-v4-flash 这类短输出模型净省有限（可用 `/replygate savings` 对比）。默认关，关闭时放行完全原样；不影响 SKIP 拦截与清空。
 - **放行后"最终未发出"统计（v1.10.0 新增）**：主模型产出正文的放行轮会登记一条"期望发送"，若在 `send_tracking_window_sec`（默认 300s，5 分钟）内没有任何真实发送（`send_service.after_send` 成功，含文本/图片等）命中，则计入"最终未发出"。窗口须覆盖图片生成等耗时发送；`status`/`savings`/`model` 清单均会展示该次数。与"主模型未回复"区分：后者是主模型连正文都没产出（只思考/只调工具未说话），前者是产出了正文但群里最终没看到消息。
-- **省 token 优化**：判定输出上限内部固定 256；SKIP 占位 user 消息仅保留最新消息前 40 字符；`collapse_repeated=true` 时可折叠相邻完全重复消息（默认关）；`at_mention_reply=true`（默认开）与 `question_word_reply=false`（默认关）是规则前置过滤，只做放行侧决策，不会因规则拦截任何消息（点名/提问轮直接放行、跳过判定模型，省掉判定 token 和延迟）；`summary_enabled=true` 时，当主 planner 输入预估超过 `summary_budget_tokens`（默认 8192），会把最旧对话交给判定模型压缩成 `[历史摘要]`（带指纹缓存、摘要失败自动回退全量），保留最近 `summary_keep_recent` 条完整消息——有损优化，默认关，放行轮生效。
+- **省 token 优化**：判定输出上限内部固定 256；SKIP 占位 user 消息仅保留最新消息前 40 字符；`collapse_repeated=true` 时可折叠相邻完全重复消息（默认关）；`at_button_reply=true`（默认开）与 `name_mention_reply=false`（默认关）、`question_word_reply=false`（默认关）是规则前置过滤，只做放行侧决策，不会因规则拦截任何消息（被@/点名/提问轮直接放行、跳过判定模型，省掉判定 token 和延迟）；`summary_enabled=true` 时，当主 planner 输入预估超过 `summary_budget_tokens`（默认 8192），会把最旧对话交给判定模型压缩成 `[历史摘要]`（带指纹缓存、摘要失败自动回退全量），保留最近 `summary_keep_recent` 条完整消息——有损优化，默认关，放行轮生效。
+
+## 配置迁移（v1.11.0）
+
+- 旧配置项 `judge.at_mention_reply` 拆分为两个独立开关：
+  - `judge.at_button_reply`（默认 `true`）：消息里**真正 @ 麦麦**（`@昵称` / `@QQ号`）→ 直接放行，跳过判定模型；
+  - `judge.name_mention_reply`（默认 `false`）：**无 @ 但提到机器人名字/别名** → 是否也直接放行，由你自行选择（默认关，避免把普通聊天误判为必回；不开启时这类消息交给判定模型判断）。
+- 直接改 `config.toml` 后重载插件即可；旧的 `at_mention_reply` 字段不再生效（已被自动忽略），请按上面两个新字段配置。
 
 ## 安全与边界
 

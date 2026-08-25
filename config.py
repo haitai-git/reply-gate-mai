@@ -77,7 +77,7 @@ class PluginSection(PluginConfigBase):
     # 掉，否则每次 WebUI 保存都会因缺少 plugin.config_version 判定为配置非法。
     # 该字段标记为 hidden，前端不展示、不同步修改。
     config_version: str = Field(
-        default="1.10.0",
+        default="1.11.0",
         description="配置版本号，由插件自带，请勿修改",
         json_schema_extra={**_ui("配置版本", "插件配置版本号，由插件自带，请勿修改"), "hidden": True},
     )
@@ -195,11 +195,21 @@ class JudgeSection(PluginConfigBase):
         description="折叠相邻完全重复的用户消息，减少刷屏占用历史",
         json_schema_extra=_ui("折叠重复消息", "把相邻完全相同的用户消息折叠为一条（语义无损失），减少刷屏占用；默认关"),
     )
-    # 规则前置过滤：被@或提起机器人名字 → 直接判 REPLY 放行并跳过判定模型（默认开）。
-    at_mention_reply: bool = Field(
+    # 规则前置过滤（真 @ 按钮）：消息里真正 @ 了麦麦（文本含 "@昵称"/"@QQ号"，MaiBot
+    # 会把 @ 富文本渲染成 @目标名）→ 直接判 REPLY 放行并跳过判定模型（默认开）。
+    at_button_reply: bool = Field(
         default=True,
-        description="被@或提起机器人名字时直接放行，跳过判定模型",
-        json_schema_extra=_ui("被@直接放行", "最新消息被@或提起机器人名字（昵称/别名）时直接放行主 planner，跳过判定模型"),
+        description="消息中真正 @ 麦麦（@昵称/@QQ号）时直接放行，跳过判定模型",
+        json_schema_extra=_ui("被@直接放行", "消息里真正 @ 了麦麦（@昵称/@QQ号）时直接放行主 planner，跳过判定模型；默认开"),
+    )
+    # 规则前置过滤（口头点名）：无 @ 但消息里提到麦麦名字（昵称/别名）→ 直接放行。
+    # 与 at_button_reply 分开独立开关，默认关：只是"提起名字"不代表一定要求麦麦回复，
+    # 由用户自行决定是否开启；不开启时这种消息会交给判定模型判断，不会因提到名字就
+    # 无条件放行。
+    name_mention_reply: bool = Field(
+        default=False,
+        description="无 @ 但消息提到麦麦名字时直接放行，跳过判定模型；默认关",
+        json_schema_extra=_ui("提到名字直接放行", "无 @ 但聊天提到麦麦名字（昵称/别名）时也直接放行主 planner；默认关，避免把普通聊天误判为必回"),
     )
     # 规则前置过滤：直接提问（含疑问词）→ 直接判 REPLY 放行并跳过判定模型。
     # 默认关：宽泛的提问词可能误判，先默认关闭，需要时再开。

@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "回复省流闸门",
   "description": "用你自己配置的便宜模型在进入 MaiBot planner 前判定该不该回复；判定不必回复时屏蔽主 planner 以节省 token，需要回复时再交给主 planner 完整规划。",
   "author": {
